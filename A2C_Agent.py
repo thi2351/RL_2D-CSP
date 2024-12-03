@@ -1,83 +1,161 @@
 import torch
-from A2C import A2CNetwork
+import torch.nn as nn
+import torch.optim as optim
+from Env import CuttingStockEnv
+class ActorNetWork(nn.Module):
+    def __init__(self, input_dim, hidden_dim, action_dim):
+        super(ActorNetWork, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class CriticNetWork(nn.Module):
+    def __init__(self, input_dim, hidden_dim):
+        super(CriticNetWork, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
 class A2CAgent:
-    def __init__(self, input_dim, action_dim, hidden_dim=128, lr=1e-4, gamma=0.99, device='cpu'):
+    def __init__(self, device, input_dim, action_dim, hidden_dim, lr, gamma, seed):
         self.device = device
-        self.model = A2CNetwork(input_dim, action_dim, hidden_dim).to(self.device)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        self.actor = ActorNetWork(input_dim, hidden_dim, action_dim).to(self.device)
+        self.critic = CriticNetWork(input_dim, hidden_dim).to(self.device)
+        self.optimizer_actor = optim.Adam(self.actor.parameters(), lr=lr)
+        self.optimizer_critic = optim.Adam(self.critic.parameters(), lr=lr)
         self.gamma = gamma
+        torch.manual_seed(seed)
 
     def select_action(self, state, env):
-        # Kiểm tra và chuyển đổi state thành tensor
-        state_tensor = (
-            state.clone().detach().unsqueeze(0).to(self.device)
-            if isinstance(state, torch.Tensor)
-            else torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
-        )
-        
         with torch.no_grad():
-            action_probs, _ = self.model(state_tensor)
-        action_index = torch.multinomial(action_probs, 1).item()
-        
-        # Map action index to action components using env
-        stock_index = action_index % env.num_sheet
-        size = [
-            torch.randint(1, env.max_w, (1,)).item(),
-            torch.randint(1, env.max_h, (1,)).item()
-        ]
-        position = [
-            torch.randint(0, env.max_w, (1,)).item(),
-            torch.randint(0, env.max_h, (1,)).item()
-        ]
-        
-        # Trả về dict
+            action_logits = self.actor(state.unsqueeze(0))  # Add batch dimension
+            action_probs = torch.softmax(action_logits, dim=-1).squeeze(0)
+            action = torch.argmax(action_probs).item()
+
+
+        rectangle_size = env._rectangles[0]["size"]  # Select first rectangle for simplicity
+        stock_index = env.choose_best_sheet(rectangle_size)  # Use tensor directly
+
+
+        if stock_index == -1:  # If no sheet can fit, open a new one
+            stock_index = torch.randint(0, env.num_sheet, (1,)).item()
+
+        position = torch.tensor([
+            torch.randint(0, env.max_w - rectangle_size[0].item() + 1, (1,)).item(),
+            torch.randint(0, env.max_h - rectangle_size[1].item() + 1, (1,)).item()
+        ], dtype=torch.int32)
+
+
         return {
             "stock_index": stock_index,
-            "size": size,
+            "size": rectangle_size,
             "position": position
         }
 
-
     def update(self, trajectory):
-        # Trajectory unpacking
         states, actions, rewards, next_states, dones = trajectory
-
-        # Kiểm tra và xử lý định dạng của states
-        if isinstance(states[0], torch.Tensor):
-            states_tensor = torch.stack(states).to(self.device)
-        else:
-            raise TypeError(f"Expected states to be a list of tensors, but got {type(states[0])}")
-
-        # Tiếp tục xử lý actions và các giá trị khác như trước
-        if isinstance(actions[0], dict):
-            processed_actions = [
-                [action["stock_index"]] + action["size"] + action["position"]
-                for action in actions
-            ]
-            actions_tensor = torch.tensor(processed_actions, dtype=torch.float32).to(self.device)
-        elif isinstance(actions[0], torch.Tensor):
-            actions_tensor = actions
-        else:
-            raise TypeError(f"Expected actions to be a list of dict or tensor, but got {type(actions[0])}")
-
+        states_tensor = torch.stack(states).to(self.device)
+        actions_tensor = torch.tensor(actions, dtype=torch.long).to(self.device)
         rewards_tensor = torch.tensor(rewards, dtype=torch.float32).to(self.device)
         next_states_tensor = torch.stack(next_states).to(self.device)
         dones_tensor = torch.tensor(dones, dtype=torch.float32).to(self.device)
 
-        # Tính toán hành động và giá trị
-        action_probs, values = self.model(states_tensor)
-        _, next_values = self.model(next_states_tensor)
+        # Compute values
+        values = self.critic(states_tensor).squeeze()
+        next_values = self.critic(next_states_tensor).squeeze()
+        targets = rewards_tensor + self.gamma * next_values * (1 - dones_tensor)
 
-        # Tính toán advantages
-        advantages = rewards_tensor + self.gamma * next_values.squeeze() * (1 - dones_tensor) - values.squeeze()
-        actor_loss = -torch.log(action_probs[range(len(actions_tensor)), actions_tensor[:, 0].long()]) * advantages.detach()
-        critic_loss = advantages.pow(2)
+        # Critic loss
+        critic_loss = nn.MSELoss()(values, targets)
 
-        # Tổng hợp loss
-        loss = actor_loss.mean() + critic_loss.mean()
+        # Actor loss
+        action_logits = self.actor(states_tensor)
+        action_probs = torch.softmax(action_logits, dim=-1)
+        log_probs = torch.log(action_probs[range(len(actions_tensor)), actions_tensor])
+        advantages = (targets - values).detach()
+        actor_loss = -(log_probs * advantages).mean()
 
-        # Backpropagation
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+        # Update networks
+        self.optimizer_actor.zero_grad()
+        actor_loss.backward()
+        self.optimizer_actor.step()
 
+        self.optimizer_critic.zero_grad()
+        critic_loss.backward()
+        self.optimizer_critic.step()
+
+def test_a2c_agent():
+    # Thiết lập môi trường
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    seed = 42
+    env = CuttingStockEnv(seed=seed, num_sheet=10, max_w=100, max_h=100, min_w=50, min_h=50, max_rec_type=5, max_rect_per_type=5, device=device)
+    
+    # Khởi tạo agent
+    input_dim = env.num_sheet * env.max_w * env.max_h + env.max_rec_type * 3
+    action_dim = env.num_sheet
+    hidden_dim = 64
+    lr = 1e-3
+    gamma = 0.99
+    agent = A2CAgent(device, input_dim, action_dim, hidden_dim, lr, gamma, seed)
+
+    # Kiểm tra chọn hành động
+    state = env.reset()
+    flat_state = torch.cat([
+        state["sheet"].flatten().float().to(device),
+        torch.cat([
+            torch.cat((rect["size"].clone().detach().to(torch.float32).to(device), 
+                       torch.tensor([rect["remaining"]], dtype=torch.float32).to(device)))
+            for rect in state["rect"]
+        ])
+    ])
+    
+    action = agent.select_action(flat_state, env)
+    print("Action selected:", action)
+
+    # Xác minh hành động hợp lệ
+    assert "stock_index" in action, "Action must contain 'stock_index'."
+    assert "size" in action, "Action must contain 'size'."
+    assert "position" in action, "Action must contain 'position'."
+
+    # Tạo một trajectory đơn giản để kiểm tra cập nhật
+    trajectory = []
+    for _ in range(5):  # Giả lập 5 bước
+        next_state, reward, done, _ = env.step(action)
+        flat_next_state = torch.cat([
+            next_state["sheet"].flatten().float().to(device),
+            torch.cat([
+                torch.cat((rect["size"].clone().detach().to(torch.float32).to(device), 
+                           torch.tensor([rect["remaining"]], dtype=torch.float32).to(device)))
+                for rect in next_state["rect"]
+            ])
+        ])
+
+        trajectory.append((flat_state, action["stock_index"], reward, flat_next_state, done))
+        if done:
+            break
+        state = next_state
+        flat_state = flat_next_state
+        action = agent.select_action(flat_state, env)
+
+    # Kiểm tra cập nhật
+    agent.update(zip(*trajectory))
+    print("Update complete. No errors encountered.")
+
+if __name__ == "__main__":
+    test_a2c_agent()
