@@ -3,19 +3,73 @@ import torch.nn as nn
 import torch.optim as optim
 from Env import CuttingStockEnv
 class ActorNetWork(nn.Module):
-    def __init__(self, input_dim, hidden_dim, action_dim):
-        super(ActorNetWork, self).__init__()
-        self.model = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, action_dim),
-        )
+    def __init__(self, num_sheet, max_w, max_h, max_product_type, max_product_per_type, hidden_dim):
+        super(ActorNetwork, self).__init__()
 
-    def forward(self, x):
-        return self.model(x)
+        self.num_sheet = num_sheet
+        self.max_w = max_w
+        self.max_h = max_h
+        self.max_product_type = max_product_type
+        self.max_product_per_type = max_product_per_type
 
+        # CNN layers với 1 channel đầu vào
+        # Mỗi lớp CNN sẽ giảm kích thước ảnh mà không thay đổi số lượng channel
+        self.conv1 = nn.Conv2d(1, 1, kernel_size=3, stride=2, padding=1)  # CNN đầu tiên (stride=2 để thu nhỏ ảnh)
+        self.conv2 = nn.Conv2d(1, 1, kernel_size=3, stride=2, padding=1)  # CNN thứ hai
+        self.conv3 = nn.Conv2d(1, 1, kernel_size=3, stride=2, padding=1)  # CNN thứ ba
+
+        # FC layers
+        # Kích thước đầu vào của fully connected layer phụ thuộc vào kích thước sau khi qua CNN
+        self.fc1 = nn.Linear(num_sheet*(max_w // 8 + 1) * (max_h // 8 + 1) + 3*max_product_type, hidden_dim)  # Flatten layer
+        self.fc2 = nn.Linear(hidden_dim, num_sheet)  # Output layer (số sheet)
+
+    def preprocess(self, observation_stocks):
+        """
+        Chuyển ma trận stock thành ma trận nhị phân: 1 cho vùng có thể đặt vật thể, 0 cho vùng không thể.
+        """
+        return torch.where(observation_stocks == -1, torch.tensor(1.0, dtype=torch.float32), torch.tensor(0.0, dtype=torch.float32))  # Vùng có thể đặt = 1, còn lại = 0
+
+    def forward(self, observation_stocks, observation_products):
+        """
+        observation_stocks: Các tấm stock (num_sheet x max_w x max_h)
+        observation_products: (length, width, quantity) của mỗi sản phẩm
+        """
+        # Tiền xử lý các tấm stock
+        observation_stocks = self.preprocess(observation_stocks)
+
+        # Thực hiện CNN
+        cnn_outs = []
+        for i in range(self.num_sheet):
+            sheet = observation_stocks[i].unsqueeze(0)  # Lấy tấm stock i và thêm batch dimension
+            sheet = F.relu(self.conv1(sheet))  # Convolution đầu tiên
+            sheet = F.relu(self.conv2(sheet))  # Convolution thứ hai
+            sheet = F.relu(self.conv3(sheet))  # Convolution thứ ba
+            sheet = sheet.view(sheet.size(0), -1)  # Flatten các tấm stock
+            cnn_outs.append(sheet)
+
+        cnn_out = torch.cat(cnn_outs, dim=1)  # Kết hợp đặc trưng từ các tấm stock
+        print(cnn_out.shape)
+        # Xử lý thông tin sản phẩm (length, width, quantity)
+        product_features = []
+        for i in range(self.max_product_type):
+            # Lấy kích thước và số lượng của sản phẩm
+            length, width = observation_products[i]["size"]
+            quantity = observation_products[i]["quantity"]
+            product_features.append(torch.tensor([length, width, quantity], dtype=torch.float32))  # Đảm bảo sử dụng float32
+
+        product_features = torch.stack(product_features, dim=0)  # Tạo tensor với các đặc trưng sản phẩm
+
+        # Chuyển đổi product_features thành dạng 1 chiều để kết hợp với cnn_out
+        product_features = product_features.view(1, -1)  # Thêm batch dimension (1, max_product_type * 3)
+
+        # Kết hợp đặc trưng từ CNN và thông tin sản phẩm
+        combined_input = torch.cat([cnn_out, product_features], dim=1)
+
+        # Lớp FC
+        x = F.relu(self.fc1(combined_input))  # Chuyển qua FC1
+        action_probs = self.fc2(x)  # Output: Các giá trị Q cho các hành động (sheet)
+        action_probs = F.softmax(action_probs)
+        return action_probs
 
 class CriticNetWork(nn.Module):
     def __init__(self, input_dim, hidden_dim):
